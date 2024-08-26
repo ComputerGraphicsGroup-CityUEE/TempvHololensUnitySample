@@ -1,0 +1,546 @@
+﻿#pragma max_recursion_depth 4
+#define	G_PI 3.14159265358979323846
+
+#include "../../ShaderLibrary/Common.hlsl"
+#include "../../ShaderLibrary/PRNG.hlsl"
+
+#define MAX_DEPTH (1)
+#define NUM_OF_SAMPLES (400)
+
+RWTexture2D<float4> _OutputTarget;
+TextureCube<float4> _CubeTexture : register(t2);
+Texture2D<float4> _sat;
+Texture2D<float4> _lutBrdf;
+
+sampler _SamLinearClamp : register(s1);
+sampler sampler_sat;
+sampler sampler_lutBrdf;
+
+float _HDRExposure;
+float4 _HDRTint;
+half4 _SamLinearClamp_HDR;
+
+StructuredBuffer<int> _weld_v_all;
+
+StructuredBuffer<float3> _ls_v;
+StructuredBuffer<float3> _ls_vn;
+StructuredBuffer<int> _vtIdx;
+StructuredBuffer<int> _weld_vtIdx;
+StructuredBuffer<int> _weld_vtIdx_map;
+StructuredBuffer<int> _des_ei;
+StructuredBuffer<float> _des_es;
+StructuredBuffer<float4> _vfEdgesMap;
+StructuredBuffer<int> _des_vinfo;
+StructuredBuffer<float4> _satArray;
+
+
+#define INPUT_EMAP _vfEdgesMap
+#define INPUT_EDAT_EI _des_ei
+#define INPUT_EDAT_ES _des_es
+#define INPUT_VMAP_NOWELD _ls_v
+#define INPUT_VNMAP_NOWELD _ls_vn
+
+#include "../../ShaderLibrary/satlookup.hlsl"
+#include "../../ShaderLibrary/sat_radiance_eval.hlsl"
+
+float4 _OutputTargetSize;
+int _FrameIndex;
+int _EnableAccumulate;
+int _RayPerPixel;
+int _RenderTypeFlag;
+int _EnableIndirect;
+int _VsatIndirectBounce;
+
+[shader("raygeneration")]
+void MISRayGenShader()
+{
+    uint2 texdim, texpos;
+    // _OutputTarget.GetDimensions(texdim.x,texdim.y);
+    texdim = DispatchRaysDimensions().xy;
+    texpos = DispatchRaysIndex().xy;
+    uint seed = tea( texdim.x*texpos.y+texpos.x, _FrameIndex*1024 );
+
+    
+    const uint2 dispatchIdx = DispatchRaysIndex().xy;
+    const uint PRNGIndex = dispatchIdx.y * texdim.x + dispatchIdx.x;
+  
+    float4 fValue;
+    float4 pTotal = 0.00001f;
+    float4 finalColor = float4(0, 0, 0, 0);
+    float4 rtxColor = float4(0, 0, 0, 1);
+    float4 satColor = float4(0, 0, 0, 1);
+    float4 bgColor = float4(0, 0, 0, 1);
+
+    // Initialize ray
+    float3 origin;
+    float3 direction;
+
+    // float2 offset = float2(GetRandomValue(PRNGStates), GetRandomValue(PRNGStates));
+    float2 offset = float2(g_rand(seed), g_rand(seed));
+    GenerateCameraRayWithOffset(origin, direction, offset);
+  
+    // Prepare initial ray
+    RayDesc rayDescriptor;
+    rayDescriptor.Origin = origin;
+    rayDescriptor.Direction = direction;
+    rayDescriptor.TMin = 1e-5f;
+    rayDescriptor.TMax = _CameraFarDistance;
+  
+    // Prepare initial payload
+    RayIntersection rayIntersection;
+    //rayIntersection.PRNGStates = PRNGStates;
+    // rayIntersection.color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    rayIntersection.reflector = 1;
+    rayIntersection.direction = direction;
+    rayIntersection.isFirstHit = true;
+
+    rayIntersection.kd = float3(1,1,1);
+    rayIntersection.ks = float3(1,1,1);
+    rayIntersection.roughness = 0;
+    float roughness_acc = 0;
+    // per pixel send ray
+    TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, rayDescriptor, rayIntersection);
+    //PRNGStates = rayIntersection.PRNGStates;
+
+    // miss, hit backgroundColor
+    if(rayIntersection.reflector == 0)
+    {
+        bgColor = rayIntersection.color;
+    }
+
+    // MIS rendering
+    if (_RenderTypeFlag==0 && !_EnableIndirect){
+        // hit object, it must hit
+        if(rayIntersection.reflector == 1)
+        {
+            //finalColor = rayIntersection.color;
+
+            // Get current hit position in world space.
+            float3 hitPositionWS = origin + direction * rayIntersection.hitT;
+            float3 normalWS = rayIntersection.normalWS;     // remapNormal ∈ (0, 1)
+            float shininess = 80000;
+            {
+                float n;
+                n = pow(2,(1-rayIntersection.roughness)*6+2);
+                shininess = float(n*n)/4.f;
+            }
+
+            // Prepare a reflection ray from hit point.
+            RayDesc reflectionRayDescriptor;
+            reflectionRayDescriptor.Origin = hitPositionWS + 0.001f * normalWS;
+            reflectionRayDescriptor.TMin = 1e-5f;
+            reflectionRayDescriptor.TMax = _CameraFarDistance;
+
+            RayIntersection reflectionRayIntersection;
+            // reflectionRayIntersection.PRNGStates = rayIntersection.PRNGStates;
+
+            float3 an = rayIntersection.normalOS;
+            float3 eye = -normalize(direction);
+
+            float3 f0 = float3(0.04, 0.04, 0.04);  
+            float3 val = rayIntersection.color;
+            float3 kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - rayIntersection.metallic) / G_PI / 2.f;
+            float3 ks = mix(f0, val, rayIntersection.metallic);
+            float2 brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - rayIntersection.roughness )).xy;
+            ks = ks * brdf.x + brdf.y;
+
+            rayIntersection.kd = kd;
+            rayIntersection.ks = ks;
+
+            //float cDiffuse = rayIntersection.kDiffuse / (rayIntersection.kDiffuse + rayIntersection.kSpecular);
+            //float cSpecular = rayIntersection.kSpecular / (rayIntersection.kDiffuse + rayIntersection.kSpecular);
+            float cDiffuse = length(kd)*G_PI / (length(kd)*G_PI + length(ks)*.72f);
+            float cSpecular = length(ks)*.72f  / (length(kd)*G_PI + length(ks)*.72f);
+
+            float3 scatteredDir;
+            ////////////////////////////////////////////////////////
+            //// for loop ray_per_pixel, MIS Rogers
+            for(int i=0; i<_RayPerPixel; i++)
+            {
+                float pickPdfRandomVal = g_rand(seed); //GetRandomValue(rayIntersection.PRNGStates);
+                // Random pick a direction
+                if (pickPdfRandomVal < cDiffuse)   
+                {
+                    // Diffuse
+                    // This seed is related to frame index and pixel position.
+                    
+                    scatteredDir = diffuse_sample(seed, normalWS); 
+                }
+                else
+                {
+                    // Specular
+                    scatteredDir = glossy_sample0(seed, direction, normalWS, shininess);
+                }
+
+                if (dot(scatteredDir, normalWS) > 0.0f)
+                {
+                    // Define reflection ray direction as new random direction.
+                    reflectionRayDescriptor.Direction = scatteredDir;
+                    reflectionRayIntersection.direction = scatteredDir;
+                
+                    TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, reflectionRayDescriptor, reflectionRayIntersection);
+                    reflectionRayIntersection.isFirstHit = false;
+                    // rayIntersection.PRNGStates = reflectionRayIntersection.PRNGStates;
+
+                    if (reflectionRayIntersection.reflector == 0.0f)
+                    {
+                        float pDiffuse = max(dot(normalWS, scatteredDir), 0) / G_PI;
+                        float pSpecular = pow( max(dot(scatteredDir, reflect(direction, normalWS)), 0), shininess) / (2 * G_PI / (shininess + 1));
+
+                        float3 fval00   = reflectionRayIntersection.color.xyz * ( G_PI * kd * pDiffuse + .72f * ks * pSpecular );
+
+                        // This is an incorrect implementation!!! Please fix it!!! 
+                        // It is used to obtain an MIS image with a similar color to that of VSAT. 
+                        //float3 fval00   = reflectionRayIntersection.color.xyz * ( G_PI * kd * pDiffuse*G_PI/2 + .72f * ks * pSpecular*G_PI/2 );
+
+
+
+
+                        //float3 fval00   = reflectionRayIntersection.color.xyz * ( .72f * ks * pSpecular );
+                        pTotal =(cDiffuse * pDiffuse  + cSpecular * pSpecular); //pDiffuse;//
+                        //pTotal =(1 * pSpecular); //pDiffuse;//
+                        rtxColor += float4(fval00, 1) / pTotal;
+                        //rtxColor = float4(normalWS.xyz, 1.f);
+                    }
+                }
+            }
+            
+            //  end of for loop ray_per_pixel, MIS Rogers
+            ////////////////////////////////////////////////////////
+            rtxColor /= _RayPerPixel;
+            rtxColor.w = 1;
+        
+        }
+    }
+
+    // RTX Direct + Indirect
+    if (_RenderTypeFlag==0 && _EnableIndirect)
+    {
+        // hit object, it must hit
+        if(rayIntersection.reflector == 1)
+        {
+            float3 rtxcol = float3(0,0,0);
+
+            float3 an = rayIntersection.normalOS;
+            float3 eye = -normalize(direction);
+            float3 f0 = float3(0.04, 0.04, 0.04);  
+            float3 val = rayIntersection.color;
+            float3 kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - rayIntersection.metallic) / G_PI / 2.f;
+            float3 ks = mix(f0, val, rayIntersection.metallic);
+            float2 brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - rayIntersection.roughness )).xy;
+            ks = ks * brdf.x + brdf.y;
+
+            rayIntersection.kd = kd;
+            rayIntersection.ks = ks;
+            rayIntersection.isFirstHit = false;
+
+            float shininess0 = 80000;
+            {
+                float n;
+                n = pow(2,(1-rayIntersection.roughness)*6+2);
+                shininess0 = float(n*n)/4.f;
+            }
+
+            RayIntersection r0 = rayIntersection;
+
+            float3 pos0, dir0;
+                pos0 = origin;
+                dir0 = direction;
+            float3 tx, ty, tz;
+            float cost, sint, phi;
+            int i, j;
+
+            //// for loop ray_per_pixel, MIS Rogers
+            for(int i=0; i<_RayPerPixel; i++)
+            {
+                float3 p1 = pos0 + dir0 * r0.hitT;
+                float3 normalWS = r0.normalWS;     // remapNormal ∈ (0, 1)
+                float3 diffuse_dir0, specular_dir0;
+                diffuse_dir0 = diffuse_sample(seed, normalWS);
+                specular_dir0 = glossy_sample0(seed, dir0, normalWS, shininess0);
+
+                //first bounce Diffuse
+                {
+                    RayDesc diffuse0RayDescriptor;
+                        diffuse0RayDescriptor.Origin = p1;//hitPositionWS + 0.001f * normalWS;
+                        diffuse0RayDescriptor.TMin = 1e-5f;
+                        diffuse0RayDescriptor.TMax = _CameraFarDistance;
+                    RayIntersection kd0RayIntersection;
+
+                    diffuse0RayDescriptor.Direction = diffuse_dir0;
+                    kd0RayIntersection.direction = diffuse_dir0;
+
+                    TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, diffuse0RayDescriptor, kd0RayIntersection);
+                    kd0RayIntersection.isFirstHit = false;
+
+                    if (kd0RayIntersection.reflector == 0.0f)
+                        rtxcol +=kd0RayIntersection.color * r0.kd * G_PI;
+                    else if(1)
+                    {
+                        an = kd0RayIntersection.normalOS;
+                        eye = -normalize(diffuse_dir0);
+                        f0 = float3(0.04, 0.04, 0.04);  
+                        val = kd0RayIntersection.color;
+                        kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - kd0RayIntersection.metallic) / G_PI / 2.f;
+                        ks = mix(f0, val, kd0RayIntersection.metallic);
+                        brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - kd0RayIntersection.roughness )).xy;
+                        ks = ks * brdf.x + brdf.y;
+
+                        kd0RayIntersection.kd = kd;
+                        kd0RayIntersection.ks = ks;
+
+                        float shininess = 80000;
+                        {
+                            float n = pow(2,(1-kd0RayIntersection.roughness)*6+2);
+                            shininess = float(n*n)/4.f;
+                        }
+                        normalWS = kd0RayIntersection.normalWS; 
+
+                        float3 kd1 = r0.kd * kd0RayIntersection.kd;
+                        float3 ks1 = r0.kd * kd0RayIntersection.ks;
+                        float3 p2 = p1 + diffuse_dir0 * kd0RayIntersection.hitT;
+                        float3 diffuse_dir1, specular_dir1;
+
+                        //second bounce diffuse - dd
+                        diffuse_dir1 = diffuse_sample(seed, normalWS);
+                        RayDesc diffuse1RayDescriptor;
+                            diffuse1RayDescriptor.Origin = p2;//hitPositionWS + 0.001f * normalWS;
+                            diffuse1RayDescriptor.TMin = 1e-5f;
+                            diffuse1RayDescriptor.TMax = _CameraFarDistance;
+                        RayIntersection kd1RayIntersection;
+
+                        diffuse1RayDescriptor.Direction = diffuse_dir1;
+                        kd1RayIntersection.direction = diffuse_dir1;
+                        TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, diffuse1RayDescriptor, kd1RayIntersection);
+                        kd1RayIntersection.isFirstHit = false;
+                        if(kd1RayIntersection.reflector == 0.0f)
+                            rtxcol +=kd1 * kd1RayIntersection.color * G_PI;
+
+                        //second bounce specular - ds
+                        specular_dir1 = glossy_sample(kd0RayIntersection.PRNGStates, diffuse_dir0, normalWS, shininess);
+                        specular_dir1 = glossy_sample0(seed, diffuse_dir0, normalWS, shininess);
+                        RayDesc specular1RayDescriptor;
+                            specular1RayDescriptor.Origin = p2;//hitPositionWS + 0.001f * normalWS;
+                            specular1RayDescriptor.TMin = 1e-5f;
+                            specular1RayDescriptor.TMax = _CameraFarDistance;
+                        RayIntersection ks1RayIntersection;
+
+                        specular1RayDescriptor.Direction = specular_dir1;
+                        ks1RayIntersection.direction = specular_dir1;
+                        TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, specular1RayDescriptor, ks1RayIntersection);
+                        ks1RayIntersection.isFirstHit = false;
+                        if(ks1RayIntersection.reflector == 0.0f)
+                            rtxcol +=ks1 * ks1RayIntersection.color * 0.72f;
+                    }
+                }
+
+                //first bounce Specular
+                {
+                    RayDesc specular0RayDescriptor;
+                        specular0RayDescriptor.Origin = p1;//hitPositionWS + 0.001f * normalWS;
+                        specular0RayDescriptor.TMin = 1e-5f;
+                        specular0RayDescriptor.TMax = _CameraFarDistance;
+                    RayIntersection ks0RayIntersection;
+
+                    specular0RayDescriptor.Direction = specular_dir0;
+                    ks0RayIntersection.direction = specular_dir0;            
+                
+                    TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, specular0RayDescriptor, ks0RayIntersection);
+                    ks0RayIntersection.isFirstHit = false;
+                    if (ks0RayIntersection.reflector == 0.0f)
+                        rtxcol +=ks0RayIntersection.color * r0.ks * 0.72;
+                    else if(1)
+                    {
+                        an = ks0RayIntersection.normalOS;
+                        eye = -normalize(specular_dir0);
+                        f0 = float3(0.04, 0.04, 0.04);  
+                        val = ks0RayIntersection.color;
+                        kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - ks0RayIntersection.metallic) / G_PI / 2.f;
+                        ks = mix(f0, val, ks0RayIntersection.metallic);
+                        brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - ks0RayIntersection.roughness )).xy;
+                        ks = ks * brdf.x + brdf.y;
+
+                        ks0RayIntersection.kd = kd;
+                        ks0RayIntersection.ks = ks;
+
+                        float shininess = 80000;
+                        {
+                            float n = pow(2,(1-ks0RayIntersection.roughness)*6+2);
+                            shininess = float(n*n)/4.f;
+                        }
+                        normalWS = ks0RayIntersection.normalWS;         
+                    
+                        float3 kd1 = r0.ks * ks0RayIntersection.kd;
+                        float3 ks1 = r0.ks * ks0RayIntersection.ks;
+                        float3 p2 = p1 + specular_dir0 * ks0RayIntersection.hitT;
+                        float3 diffuse_dir1, specular_dir1;
+
+                        // second bounce diffuse -- sd 
+                        diffuse_dir1 = diffuse_sample(seed, normalWS);
+                        RayDesc diffuse1RayDescriptor;
+                            diffuse1RayDescriptor.Origin = p2;//hitPositionWS + 0.001f * normalWS;
+                            diffuse1RayDescriptor.TMin = 1e-5f;
+                            diffuse1RayDescriptor.TMax = _CameraFarDistance;
+                        RayIntersection kd1RayIntersection;
+
+                        diffuse1RayDescriptor.Direction = diffuse_dir1;
+                        kd1RayIntersection.direction = diffuse_dir1;
+
+                        TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, diffuse1RayDescriptor, kd1RayIntersection);
+                        kd1RayIntersection.isFirstHit = false;
+                        if(kd1RayIntersection.reflector == 0.0f)
+                            rtxcol +=kd1 * kd1RayIntersection.color * G_PI;
+
+                        //second bounce specular - ss
+                        specular_dir1 = glossy_sample0(seed, specular_dir0, normalWS, shininess);
+                        RayDesc specular1RayDescriptor;
+                            specular1RayDescriptor.Origin = p2;//hitPositionWS + 0.001f * normalWS;
+                            specular1RayDescriptor.TMin = 1e-5f;
+                            specular1RayDescriptor.TMax = _CameraFarDistance;
+                        RayIntersection ks1RayIntersection;
+
+                        specular1RayDescriptor.Direction = specular_dir1;
+                        ks1RayIntersection.direction = specular_dir1;
+                        TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, specular1RayDescriptor, ks1RayIntersection);
+                        ks1RayIntersection.isFirstHit = false;
+                        if(ks1RayIntersection.reflector == 0.0f)
+                            rtxcol +=ks1 * ks1RayIntersection.color * 0.72f;
+                    }
+                }
+            }
+            //  end of for loop ray_per_pixel, MIS Rogers
+            ////////////////////////////////////////////////////////
+            rtxColor = float4(rtxcol.xyz, 1);
+            rtxColor /= _RayPerPixel;
+        }
+    }
+    
+    //VSAT rendering
+    if (_RenderTypeFlag==1)
+    {
+        if(rayIntersection.reflector == 1)
+        { 
+            float2 spos = float2(dispatchIdx.x, dispatchIdx.y);
+            float3 epos = origin; 
+            float4x4 mtx4 = float4x4(
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f
+            );
+            int ti = rayIntersection.ti;
+            float3 bc = rayIntersection.barycentricCoordinates;      // barycentricCoordinates
+            float3 av = origin + direction * rayIntersection.hitT;   // hit position
+            roughness_acc = clamp(roughness_acc+rayIntersection.roughness, 0, 1);
+
+            float3 an = rayIntersection.normalOS;
+            float3 eye = -normalize(direction);
+            float3 val = rayIntersection.color;
+            float3 f0 = float3(0.04, 0.04, 0.04);
+            float3 kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - rayIntersection.metallic) / G_PI / 2.f;
+            float3 ks = mix(f0, val, rayIntersection.metallic);
+            float2 brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - roughness_acc )).xy;
+            ks = ks * brdf.x + brdf.y;
+
+            kd *= rayIntersection.ks;
+            ks *= rayIntersection.ks;
+            rayIntersection.isFirstHit = false;
+
+            uint4 PRNGStates00 = uint4(0,0,0,0); 
+            uint seed = tea(PRNGIndex, 0);
+
+            //float3 scatteredDir = glossy_sample(PRNGStates00, direction, rayIntersection.normalWS, rayIntersection.shininess);
+            uint vi_noweld = rayIntersection.vi_noweld;
+
+            satColor += main2(spos, epos, mtx4, 
+                               ti, bc, av, an,
+                               kd, ks, roughness_acc, seed, 
+                               vi_noweld);
+
+            rayIntersection.kd = kd;
+            //rayIntersection.ks = ks*((1-tanh(4-roughness_acc*4))*2+1);
+            rayIntersection.ks = ks*((1-tanh(4-rayIntersection.roughness*4))*2+1);
+            rayIntersection.isFirstHit = false;
+            
+            int n_bounce = _VsatIndirectBounce;
+            float3 pos0 = origin; // initial ray origin 
+            float3 dir0 = direction; //initial ray direction
+
+            // VSAT Indirect
+            if(_EnableIndirect)
+            {
+                int gi;
+                for( gi=0; gi<n_bounce; gi++ )
+                {
+                    pos0 = pos0 + dir0 * rayIntersection.hitT;
+                    //dir0 = glossy_sample(PRNGStates00, dir0, rayIntersection.normalWS, rayIntersection.shininess);
+                    dir0 = glossy_sample0(seed, dir0, rayIntersection.normalWS, rayIntersection.shininess);
+                    rayDescriptor.Origin = pos0;
+                    rayDescriptor.Direction = dir0;
+                    TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, rayDescriptor, rayIntersection);
+                    rayIntersection.isFirstHit = false;
+                    if( rayIntersection.reflector<.5 ) // miss shader
+                        break;
+
+                    roughness_acc = clamp(roughness_acc+rayIntersection.roughness, 0, 1);
+
+                    an = rayIntersection.normalOS;
+                    av = pos0 + dir0 * rayIntersection.hitT;   // hit position
+                    eye = -normalize(dir0);
+                    epos = pos0;
+                    val = rayIntersection.color;
+                    kd = val * (float3(1.0, 1.0, 1.0) - f0) * (1.0 - rayIntersection.metallic) / G_PI / 2.f;
+                    ks = mix(f0, val, rayIntersection.metallic);
+                    brdf = Texture_LutBrdf(float2( max( dot(eye, an), 0 ), 1.0 - roughness_acc )).xy;
+                    ks = ks * brdf.x + brdf.y;
+                    kd *= rayIntersection.ks;
+                    ks *= rayIntersection.ks;
+                    ti = rayIntersection.ti;
+                    bc = rayIntersection.barycentricCoordinates;      // barycentricCoordinates
+
+                    seed = tea(PRNGIndex, _FrameIndex * _OutputTargetSize.x);
+
+                    vi_noweld = rayIntersection.vi_noweld;
+
+                    satColor += main2(spos, epos, mtx4, 
+                                       ti, bc, av, an,
+                                       kd, ks, roughness_acc, seed, 
+                                       vi_noweld);
+
+                    rayIntersection.kd = kd;
+                    //rayIntersection.ks = ks*((1-tanh(4-roughness_acc*4))*2+1);
+                    rayIntersection.ks = ks*((1-tanh(4-rayIntersection.roughness*4))*2+1);
+
+                    float atteun =  get_attenuation( 0, 0, rayIntersection.hitT );
+                    rayIntersection.kd *=atteun;
+                    rayIntersection.ks *=atteun;      
+                    
+                }
+            }
+        }
+    }
+    finalColor = bgColor + rtxColor + satColor;
+    
+    // Accumulate weighted result
+    if (_EnableAccumulate)
+        if (_FrameIndex > 1)
+        {
+            float a = 1.0f / (float)_FrameIndex;
+            finalColor = _OutputTarget[dispatchIdx] * (1.0f - a) + finalColor * a;
+        }
+        
+    _OutputTarget[dispatchIdx] = float4( finalColor.xyz, 1 );
+
+}
+
+[shader("miss")]
+void MissShader(inout RayIntersection rayIntersection : SV_RayPayload)
+{
+    if (rayIntersection.isFirstHit) 
+        rayIntersection.color = float4(0, 0, 0, 0); 
+    else
+        rayIntersection.color = _CubeTexture.SampleLevel(_SamLinearClamp, rayIntersection.direction, 0);
+
+    rayIntersection.reflector = 0.0f;
+    rayIntersection.normalWS = float3(0.0f, 0.0f, 0.0f);
+}

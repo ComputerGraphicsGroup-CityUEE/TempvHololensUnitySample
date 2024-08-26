@@ -1,0 +1,31 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f201ae3065eca2d4aa46b0d7b2f8dfa2, type: 3}
+  m_Name: CubeMapSetting
+  m_EditorClassIdentifier: 
+  m_PfmFilePath:
+    pfm_path: Assets/Resources/pfm/enviornment-map/
+    pfm_right: stpeters_cross.tt.zp.pfm
+    pfm_left: stpeters_cross.tt.zn.pfm
+    pfm_top: stpeters_cross.tt.yp.pfm
+    pfm_bottom: stpeters_cross.tt.yn.pfm
+    pfm_front: stpeters_cross.tt.xp.pfm
+    pfm_back: stpeters_cross.tt.xn.pfm
+  m_HDRParams:
+    exposureToGamma: 0.5
+    Tint: {r: 0.50002164, g: 0.50002164, b: 0.50002164, a: 0}
+    colorDecodeFlag: 0
+  m_cm2smParams:
+    useImportEnviornmentMap: 1
+    showNormal: 0
+    showFaces: 0
+    debug: 0
